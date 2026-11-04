@@ -4,18 +4,19 @@
 // 为什么自己写：此前归档走系统 tar —— Windows 是 bsdtar（能产真 zip），
 // Linux 的 GNU tar 对 .zip 后缀实际产 tar 容器、且读不了真 zip，
 // 于是**包不能跨操作系统互通**（CI 上暴露过一次）。
-// 现在「创建 / 列成员 / 解包」全走这里：node:zlib 的 deflateRawSync / inflateRawSync。
+// 现在「创建 / 列成员 / 解包」全走这里：node:zlib 的 deflateRaw / inflateRaw。
 //
 // 边界（有意为之）：
 //   - 本模块只处理**明文 zip**。加密包（PKENC1 + scrypt + aes-256-gcm，见 crypto.mjs）由
-//     index.mjs 的解包入口先嗅探魔数、解密成临时 zip 后再调用本模块（契约 §8），
-//     所以这里不做加密格式判断，避免格式逻辑分散两处；
-//   - 整文件读入内存：打包对象是配置/技能/记忆镜像，量级在 MB 以内；
-//   - 不支持 zip64：遇到就明确报错，绝不静默错读。
+//     解包入口先嗅探魔数、解密成临时 zip 后再调用本模块，所以这里不做加密格式判断，
+//     避免格式逻辑分散两处；
+//   - 整文件读入内存：打包对象是配置 / 技能 / 记忆镜像，量级在 MB 以内；
+//   - **不支持 zip64**：读取端遇到就明确报错，绝不静默错读；写入端同样先 fail-fast。
 // ============================================================================
 import fs from 'node:fs'
-import fsp from 'node:fs/promises'
 import zlib from 'node:zlib'
+
+import { MAX_ENTRY_BYTES } from './lib/constants.mjs'
 
 const SIG_LOCAL = 0x04034b50
 const SIG_CENTRAL = 0x02014b50
@@ -25,6 +26,9 @@ const S_IFMT = 0xf000
 const S_IFDIR = 0x4000
 const S_IFLNK = 0xa000
 const S_IFREG = 0x8000
+
+/** ZIP 经典格式的单包条目数上限（超过需要 zip64；本实现明确不支持） */
+export const MAX_ENTRY_COUNT = 0xffff
 
 const CRC_TABLE = (() => {
   const t = new Int32Array(256)
@@ -48,8 +52,24 @@ function dosDateTime(d = new Date()) {
   return { time, date }
 }
 
-/** 把条目写成 zip 字节：{ name（用 '/' 分隔）, data(Buffer|string) }[] */
+/**
+ * 把条目写成 zip 字节。
+ *
+ * v0.7.0：**先 fail-fast 再动手**。旧实现在写完所有 staging 副本、算完所有哈希之后，
+ * 才在写 EOCD 时因条目数溢出 UInt16 而抛一句 Node 内部 RangeError —— 用户等了几分钟，
+ * 最后一步崩在一个看不懂的报错上。现在在入口就把边界说清楚，并给出可行动的提示。
+ *
+ * @param {{name:string, data:Buffer|string, unixMode?:number}[]} entries
+ * @param {Date} [now]
+ */
 export function buildZip(entries, now = new Date()) {
+  if (!Array.isArray(entries)) throw new TypeError('buildZip 需要条目数组')
+  if (entries.length > MAX_ENTRY_COUNT) {
+    throw new Error(
+      `文件数 ${entries.length} 超过 ZIP 经典格式上限 ${MAX_ENTRY_COUNT}（本版本不支持 zip64）。`
+      + '请减少勾选内容 —— 通常是「已安装插件」模块带入了过多依赖文件，取消勾选即可打包。',
+    )
+  }
   const { time, date } = dosDateTime(now)
   const localParts = []
   const centralParts = []
@@ -57,6 +77,9 @@ export function buildZip(entries, now = new Date()) {
   for (const e of entries) {
     const nameBuf = Buffer.from(String(e.name).replace(/\\/g, '/'), 'utf-8')
     const data = Buffer.isBuffer(e.data) ? e.data : Buffer.from(e.data ?? '')
+    if (data.length > MAX_ENTRY_BYTES) {
+      throw new Error(`单个文件超过 ${MAX_ENTRY_BYTES} 字节上限：${e.name}`)
+    }
     // 压缩后没变小就原样存（stored），避免小文件白搭 deflate 头
     const comp = zlib.deflateRawSync(data, { level: 9 })
     const useDeflate = comp.length < data.length
@@ -91,13 +114,16 @@ export function buildZip(entries, now = new Date()) {
     ch.writeUInt32LE(data.length, 24)
     ch.writeUInt16LE(nameBuf.length, 28)
     // 外部属性高 16 位 = Unix 权限；>>>0 避免 32 位符号溢出。
-    // 默认普通文件；可传 unixMode（如 0o120777 = 符号链接）用于构造/校验非普通成员
+    // 默认普通文件 0644；打包端会传入源文件的真实权限位，避免可执行脚本丢失 +x。
     const mode = Number.isInteger(e.unixMode) ? e.unixMode : 0o100644
     ch.writeUInt32LE((mode << 16) >>> 0, 38)
     ch.writeUInt32LE(offset, 42)
     centralParts.push(ch, nameBuf)
 
     offset += lh.length + nameBuf.length + body.length
+    if (offset > 0xffffffff) {
+      throw new Error('包体积超过 4GB（ZIP 经典格式上限），本版本不支持 zip64')
+    }
   }
   const central = Buffer.concat(centralParts)
   const eocd = Buffer.alloc(22)
@@ -133,7 +159,9 @@ export function parseZip(buf) {
   const entries = []
   let p = cdOff
   for (let i = 0; i < count; i++) {
-    if (p + 46 > buf.length || buf.readUInt32LE(p) !== SIG_CENTRAL) throw new Error('中央目录损坏（记录数与内容不一致）')
+    if (p + 46 > buf.length || buf.readUInt32LE(p) !== SIG_CENTRAL) {
+      throw new Error('中央目录损坏（记录数与内容不一致）')
+    }
     const flags = buf.readUInt16LE(p + 8)
     const method = buf.readUInt16LE(p + 10)
     const crc = buf.readUInt32LE(p + 16)
@@ -151,6 +179,12 @@ export function parseZip(buf) {
   return entries
 }
 
+/**
+ * 读取 zip 文件（同步）。
+ *
+ * 注：保持与历史契约同步返回 `{ buf, entries }`，上层测试与 API 均以同步方式解构。
+ * 整包读入对典型配置包（几十 MB 级）开销可控；超大包场景可在未来按需改为流式读取。
+ */
 export function readZipFile(zipPath) {
   const buf = fs.readFileSync(zipPath)
   return { buf, entries: parseZip(buf) }
@@ -166,8 +200,13 @@ export function entryKind(e) {
   return 'special'
 }
 
-/** 读取单个条目内容（并校验 CRC） */
-export function readEntryData(buf, e) {
+/**
+ * 读取单个条目内容（校验 CRC 与解压后体积）。
+ *
+ * v0.7.0：给 inflateRawSync 加 maxOutputLength —— 旧实现对恶意 / 损坏包没有解压上限，
+ * 一个几十 KB 的 zip 可以膨胀到几十 GB（zip bomb）。解压后还会比对声明的 size。
+ */
+export function readEntryData(buf, e, maxBytes = MAX_ENTRY_BYTES) {
   const lo = e.localOffset
   if (lo + 30 > buf.length || buf.readUInt32LE(lo) !== SIG_LOCAL) throw new Error(`本地文件头异常: ${e.name}`)
   const nameLen = buf.readUInt16LE(lo + 26)
@@ -176,9 +215,21 @@ export function readEntryData(buf, e) {
   if (start + e.compSize > buf.length) throw new Error(`成员数据越界: ${e.name}`)
   const raw = buf.subarray(start, start + e.compSize)
   let data
-  if (e.method === 0) data = Buffer.from(raw)
-  else if (e.method === 8) data = zlib.inflateRawSync(raw)
-  else throw new Error(`不支持的压缩方法 ${e.method}: ${e.name}`)
+  if (e.method === 0) {
+    data = Buffer.from(raw)
+  } else if (e.method === 8) {
+    try {
+      data = zlib.inflateRawSync(raw, { maxOutputLength: maxBytes })
+    } catch (err) {
+      if (err?.code === 'ERR_BUFFER_TOO_LARGE') {
+        throw new Error(`成员解压后超过 ${maxBytes} 字节上限，已拒绝（可能是 zip bomb）: ${e.name}`)
+      }
+      throw err
+    }
+  } else {
+    throw new Error(`不支持的压缩方法 ${e.method}: ${e.name}`)
+  }
+  if (data.length !== e.size) throw new Error(`成员解压后长度与声明不一致: ${e.name}`)
   if (crc32(data) !== e.crc) throw new Error(`成员校验失败（CRC 不匹配）: ${e.name}`)
   return data
 }

@@ -52,7 +52,11 @@ packer 跑在 host 的 **Node 运行时**里；鸿蒙把这两项能力放在 **
 
 ## 五、其他平台差异（不影响通用）
 
-1. **脱敏路径**：Windows 用户目录与 POSIX 用户目录都识别；未覆盖 `/Volumes`、`/private`、`/nix`；
+1. **脱敏路径**（v0.7.0 起）：Windows 用户目录（`C:\Users\<名>\…`）、POSIX 用户目录（`/home` `/Users`）、
+   以及家目录之前的挂载前缀（`/System/Volumes/Data`、`/Volumes/<卷名>`、`/mnt/<名>`、`/media/<名>`）
+   都会整段替换成 `<用户目录>`（不再留下半截前缀）；
+   `/Volumes/<卷名>`、`/private`、`/nix/store` 这类**本机特有**的挂载/派生路径归 `vol-path` 规则，
+   替换成 `<本机路径>` 并保留子路径。系统公共路径（`/usr` `/etc` `/var` …）刻意不动；
 2. **权限位**：仅 POSIX 有，Windows 打包跳过、恢复不还原；
 3. **外部命令**：只有回收站用到系统命令（Windows PowerShell、macOS osascript；Linux 走纯 Node），
    其余全部是 Node 内置模块（zlib / crypto / sqlite）。
@@ -62,5 +66,6 @@ packer 跑在 host 的 **Node 运行时**里；鸿蒙把这两项能力放在 **
 1. 打包（技能库 + 插件 + 记忆库）→ 校验 sha256 → 加密包再解一次；
 2. 恢复三种策略各一次，检查差异对比与结果明细；
 3. 删除包：Windows 看回收站、macOS 看废纸篓、Linux 看桌面回收站，都应能找回；鸿蒙检查 `recycled:false` + 界面 warning；
-4. 造一个含 `C:\\Users\\<name>` 与 `/home/<name>` 的文件，确认两处都被脱敏；
+4. 造一个含 `C:\Users\<name>`、`/home/<name>`、`/System/Volumes/Data/Users/<name>/…`、`/Volumes/<卷名>/…`
+   的文件，确认四处都被脱敏、且不留半截前缀；
 5. 鸿蒙额外：`/pack list`、`create`、`restore` 正常，删除返回永久删除 warning，恢复页显示「当前平台请直接填写包路径」。

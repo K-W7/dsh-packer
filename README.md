@@ -4,7 +4,7 @@
 >
 > [简体中文](README.md) · [English](README.en.md)
 
-> **v0.6.5** · MIT License · DSH 0.2.x（`>=0.2.0-rc.2 <0.3.0-0`，0.2.1-rc.3 桌面版实测）· Node ≥ 22.19.0
+> **v0.7.2** · MIT License · DSH 0.2.x（`>=0.2.0-rc.2 <0.3.0-0`，0.2.1-rc.3 桌面版实测）· Node ≥ 22.19.0
 
 dsh-packer 是 [DeepSeek Harness](https://github.com/deepseek-ai/dsh)（DSH）的「Agent 配置打包器」插件：把本地 Agent 资产按模块打包成标准 zip，用于两种场景：
 
@@ -130,19 +130,22 @@ dsh plugin --profile desktop add link:./dsh-packer
 | 规则 | 说明 |
 | --- | --- |
 | 本地绝对路径（盘符） | 盘符形式路径，如 `D:\...`、`C:/...` |
-| Unix 绝对路径 | `/home/...`、`/Users/...`、`/root/...`、`/etc/...`、`/tmp/...` 等 |
+| Unix 家目录路径 | `/home/<名>/...`、`/Users/<名>/...`、`/root/...`——**只认家目录**（路径里含「这是谁的目录」）。`/usr`、`/etc`、`/var`、`/opt`、`/srv`、`/mnt`、`/media`、`/tmp` 是系统公共路径，不含个人信息，v0.7.0 起**不再计入命中、也不再脱敏** |
 | UNC / 网络路径 | `\\服务器\共享\...` |
-| 用户目录路径 | 操作系统用户配置文件目录下的路径（`C:\Users\<名>`、`/home/<名>`、`/Users/<名>`） |
+| 用户目录路径 | 操作系统用户配置文件目录下的路径（`C:\Users\<名>`、`/home/<名>`、`/Users/<名>`）；家目录之前的挂载前缀也一并吃掉（`/System/Volumes/Data/Users/<名>/…`、`/Volumes/<卷名>/Users/<名>/…`、`/mnt|media/<名>/Users/<名>/…`），不会留下半截前缀 |
+| 挂载卷 / 派生路径 | `/Volumes/<卷名>`、`/System/Volumes/Data`、`/private`、`/nix/store`——这些是**本机特有**的（卷名由用户自定、`/private` 含逐机不同的哈希、`/nix/store` 暴露本机包布局），与 `/usr` `/etc` 这类**任何机器都一样**的系统公共路径不同，替换为 `<本机路径>` 并保留子路径 |
 | 疑似密钥 / Token 赋值 | `api_key`、`access_key`、`secret`、`password`、`token`、`bearer`、`authorization`、`credential` 等赋值——**带引号或不带引号**都算 |
 | 密钥形状 | 裸密钥本身：`sk-...`、`ghp_...`、`github_pat_...`、`glpat-...`、`AKIA...`、`xox?-...`、JWT（`eyJ.....*.*`） |
 | 个人昵称 | 用户昵称文本（由部署者通过 `config.personalPatterns` 注入） |
 
-计数按「文件 + 规则 + 行」逐处统计：同一行出现多处命中会如实累计（不会每规则只算 1 处）。
+计数口径：同一**行**内同一规则出现多处会如实累计（不会每规则只算 1 处）；同一处若被多条规则命中，各规则各自上报一次（扫描宁可多报，不漏报）。注意**扫描与脱敏口径不同**：脱敏是单遍最左扫描 + 区间去重，同一个片段只替换一次，不会出现占位符套占位符。
+
+扫描缓存：界面「先预览」与「开始打包」打的是同一个 `/create`，后端按「文件名 + 内容 SHA-256」缓存扫描结论，同一批内容不会被整篇读两遍；**内容一变指纹就变、立即重扫**，所以这是性能优化而不是正确性妥协（没有 SHA-256 的调用不进缓存；部署者改动个人敏感词后缓存整体失效）。
 
 **拦截策略**：
 
-- **分享模式** —— 命中任何规则即返回错误、**强制拦截**，不生成包。分享包是给别人用的，必须严格。
-- **迁移模式** —— 仅报告不拦截，可用 `/pack scan` 或 `--dry-run` 提前查看命中点，自行判断。
+- **分享模式** —— **命中不拦截，但强制脱敏**：忽略界面上传入的 `sanitize` 值一律按「清理后打包」处理（路径→占位符、密钥→`<已移除的密钥>`，只改包内副本、源文件不动）。分享包是给别人用的，宁可改内容也不放行原文。分享模式下**真正会打包失败**的是两类：勾了分享预设不允许的模块（**只有 `skills` 允许**，其余一律返回 `share_scope`）；有文件读不出内容、没能经过扫描（fail-closed，明确列出是哪些文件）。
+- **迁移模式** —— 仅报告不拦截，可用 `/pack scan` 或 `--dry-run` 提前查看命中点，自行判断；也可以主动选「清理后打包」。
 
 **永不打包**：`.credentials.yaml`、`.anonymous-user-id`——遍历任何模块时一律跳过，这类本地身份/凭据文件不允许进入任何包（无论迁移还是分享）。
 
@@ -255,6 +258,9 @@ dsh plugin --profile desktop add link:./dsh-packer
 
 | 版本 | 日期 | 类型 | 要点 |
 | --- | --- | --- | --- |
+| **v0.7.2** | 2026-10-28 | **修「打包失败（network · Failed to fetch）」误报** | 满量迁移（17469 个文件）时，预览响应约 3.9 MB（其中 manifest 3.5 MB）、终态轮询还要搬 2000+ 条隐私命中；宿主桥一旦在这两个大响应上断开，UI 就报 `network · Failed to fetch`，而服务端其实已经把包写完了（实测 zip 218 MB / 17470 条目完好）。三处修正：①预览只回前 1000 条文件明细 + `filesTotal`（面板本来就只渲染前 200 条）；②轮询视图把 `result.privacy` 换成 `privacyCount`（创建流程只用 `pack` / `warnings`）；③前端轮询遇到网络错误/5xx 改为退避重试（最多 10 次，≤5 s/次），不再一次抖动就判定整次失败。 |
+| **v0.7.1** | 2026-10-28 | **测试随包发布** | `files` 补 `tests`，新增 `tests/privacy.test.mjs`（零依赖，`node --test`）：锁死 shebang 原样保留、Unix 系统公共路径不计命中/不脱敏、家目录与 Windows 用户目录必须脱敏、URL 整段不动，以及 `SCHEMA_VERSION=1`（老包仍可 restore）。此前 manifest 挂了 `npm test` 但 tgz 不带 tests，装完就跑不了。 |
+| **v0.7.0** | 2026-10-27 | **工程化重构 + 隐私口径修正 + 界面无障碍** | ①**后端分层**：`index.mjs` 3204 → 306 行（只做装配与再导出），拆出 `lib/{constants,errors,logger,util,modules,privacy,recycle,archive,pack,restore,jobs,api,cli}.mjs`，隐私规则收敛为**单一规则源**（扫描与脱敏共用一份，不再各写一套正则）。②**隐私口径修正**：Unix 路径规则收窄为**只认家目录**（`/home` `/Users` `/root`），`/usr` `/etc` `/var` `/opt` `/srv` `/mnt` `/media` `/tmp` 等系统公共路径不含个人信息，不再误报也不再误脱敏（此前 `#!/usr/bin/env node` 的 shebang 会被换成 `#!<Unix路径> node`，脚本直接报废）；shebang 行与 URL 整段纳入保护区。③**前端工程化**：`lib/client.js` 由「编译产物当源码维护」改为 **TypeScript 源码 + esbuild 可复现构建**（`src/client/`：`copy` / `styles` / `types` / `format` / `api` / `hooks` / `model` / `ui` / `view/*`），`npm run typecheck` 零错误。④**界面无障碍**：弹窗补齐 `role=dialog` + `aria-modal` + `aria-labelledby` + Esc 关闭 + Tab 焦点陷阱 + 关闭后焦点归位；进度条为 `role=progressbar` 且不确定态不上报 `aria-valuenow`；表头加 `scope=col`；异步结果用 `aria-live` 播报。⑤**修复**：ZIP 经典格式 65535 条目上限改为中文语义报错（不再写出损坏包）；`/scan` 的 SQLite 快照目录不再泄漏；补上缺失的 `passwordEmpty` 文案。测试 91 → 102（新增产物冒烟与 jsdom 真实渲染两组）。⑥**脱敏补漏 + 扫描缓存**：新增「挂载卷 / 派生路径」规则——`/Volumes/<卷名>`、`/System/Volumes/Data`、`/private`、`/nix/store` 现在会被替换（此前这些前缀要么整段漏掉，要么只替换到家目录为止、留下 `/System/Volumes/Data<用户目录>/…` 这种半脱敏结果）；用户目录规则改为连挂载前缀一起吃掉。隐私扫描结果按「文件名 + 内容 SHA-256」缓存，「先预览」+「开始打包」不再把同一批文件扫两遍（内容一变立即失效）。UI 规约文档同步为 v0.7.0 结构（`docs/ui-spec.md`，取代 `ui-v060-spec.md`）。测试 103 → 106。 |
 | **v0.6.5** | 2026-10-25 | **会话图片/附件进包（换机迁移硬缺口）** | ①新增 `attachments` 模块（根 `~/.dsh/attachments`、`skipDirs: ['tmp']`、迁移默认带、分享不带）：会话日志里的图片只是 `{"type":"image","attachment":{"attachmentId":"sha256:…"}}` 引用，字节在 `attachments/v1/objects/<前2位>/<sha256>`（内容寻址、去重、只增不删）——只备份 `sessions` 的包，换机器恢复后会话里图片全裂。②`SENSITIVE_MODULES` 加 `attachments`，分享模式服务端强制拦截（不只靠界面置灰）。③设置页「会话记录」组改为 `["sessions","attachments"]`（不改 = 后端有模块、界面选不到）。④修正 `MEMORY_ROOT` 改用 `DSH_HOME`（此前用 `os.homedir()`，与 memoryDb 不同源）。⑤模块表补 `attachments`（顺带补漏写的 `plugins` 行）并写明「会话里的图片在 attachments，选『会话记录』组会一起打包」；对象内容寻址，恢复时无需改写引用。测试 87 → 91。 |
 | **v0.6.4** | 2026-10-25 | **回收站三平台分派 + 手填路径兜底** | ①**回收站按平台分派**（`recycleFileNative` 契约不变：成功 `true` / 平台不支持 `false` / 调用失败抛错→`deletePack` 降级并回报 warning）：Windows 保持 PowerShell `SendToRecycleBin`；macOS 用 `osascript -e 'tell application "Finder" to delete POSIX file "<path>"'`（引号/反斜杠转义，30s 超时）；Linux 按 freedesktop Trash 规范纯 Node 实现——文件移入 `$XDG_DATA_HOME/Trash/files/<name>`（缺省 `~/.local/share`，同名加 `.1` 后缀），`Trash/info/<name>.trashinfo` 写 `Path=`（URL 编码绝对路径）与 `DeletionDate=`（本地时间 `YYYY-MM-DDThh:mm:ss`）；鸿蒙/其他仍返回 `false`（永久删除 + warning）。②**手填路径**：恢复页「或填包路径」入口保留；`/status` 新增 `platform` / `trash` / `filePicker` 三个平台能力字段，没有系统文件选择框的平台（鸿蒙）上提示「当前平台请直接填写包路径」并以其为主入口，删除确认文案改为如实告知不可恢复；本插件在网页层拿不到宿主机路径，因此任何平台都不渲染点了没反应的选择框按钮。③路径示例按平台给（`/storage/…`、`/home/…`、`/Users/…`）。测试 80 → 87。 |
 | **v0.6.3** | 2026-10-25 | 文档 / 打包范围 | **多平台通用文档随包发布**：`files` 补 `docs`，装好插件后包内自带 `docs/platform-support.md`（Windows / macOS / Linux / 鸿蒙 的支持范围，及两处受限项：回收站、系统文件选择框）；代码与功能无变更。 |
@@ -287,7 +293,7 @@ dsh plugin --profile desktop add link:./dsh-packer
 
 **分享包被拦截怎么办？**
 
-分享模式刻意严格：只要扫到本地绝对路径、用户目录路径、疑似密钥、个人昵称等敏感痕迹就直接报错、不生成包。先运行 `/pack scan` 看哪些文件命中，清理或替换敏感内容后重试。个人备份可用迁移模式（仅报告），但请勿把这类包发给别人。
+分享模式**不因隐私命中而拦截**（命中一律强制脱敏后打包），真正会失败的只有两类：勾了分享预设不允许的模块（只有 `skills` 允许，其余返回 `share_scope`）；有文件读不出内容、没能经过扫描（fail-closed，响应里会列出是哪些文件）。前者去掉不该分享的模块即可；后者先处理那些文件（权限/占用/损坏）再重试。需要保真备份请用迁移模式（仅报告，不强制脱敏）。
 
 **「合并」策略具体怎么工作？**
 

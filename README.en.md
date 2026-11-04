@@ -4,7 +4,7 @@
 >
 > [简体中文](README.md) · [English](README.en.md)
 
-> **v0.6.5** · MIT License · DSH 0.2.x (`>=0.2.0-rc.2 <0.3.0-0`, tested on the 0.2.1-rc.3 desktop app) · Node ≥ 22.19.0
+> **v0.7.2** · MIT License · DSH 0.2.x (`>=0.2.0-rc.2 <0.3.0-0`, tested on the 0.2.1-rc.3 desktop app) · Node ≥ 22.19.0
 
 **dsh-packer** is the Agent Configuration Packer plugin for **DeepSeek Harness (DSH)**: it packs your local Agent assets, module by module, into standard zip archives, for two purposes:
 
@@ -19,7 +19,7 @@ Every module is optional (Skills / Sessions / Attachments / Profiles / Settings 
 | --- | --- |
 | Modular packing | Nine modules, any combination: `skills` / `sessions` / `attachments` (**the bytes of images/files inside sessions**, on by default for migration) / `profiles` / `plugins` (**installed plugin bodies**, on by default for migration) / `settings` / `presets` / `memory` (Markdown mirror) / `memoryDb` (**consistent SQLite snapshot of the memory truth source**, on by default) |
 | Two built-in presets | **Migrate** (everything, including installed plugin bodies and session attachments) / **Share** (Skills only; sessions, attachments, memory data, plugins and personal skill subdirectories are automatically excluded) |
-| Privacy & security scan | Detects drive-letter / Unix / UNC paths, user-directory paths, credential assignments and bare key shapes (`sk-`, `ghp_`, `AKIA`, JWT, …), plus personal nicknames, counting **every occurrence**; **share mode hard-blocks on any hit, migrate mode reports only** |
+| Privacy & security scan | Detects drive-letter / Unix / UNC paths, user-directory paths, credential assignments and bare key shapes (`sk-`, `ghp_`, `AKIA`, JWT, …), plus personal nicknames, counting **every occurrence**; **share mode force-sanitizes every hit (it never blocks on a hit), migrate mode reports only** |
 | File-level operation preview | Full file list preview before packing; diff report before restore (added / changed / same / skipped) |
 | Three conflict strategies | Overwrite / skip / merge (merge appends, never overwrites existing content) |
 | Safe restore writes | Targets are backed up to `.restore-backups/<timestamp>/` inside the packs directory first, written to a temp file and swapped in with an atomic `rename`; any failure **aborts and rolls back** the files already replaced/added |
@@ -129,19 +129,22 @@ When it finishes, the zip is written to `~/.dsh/packs/` (override with `DSH_PACK
 | Rule | Description |
 | --- | --- |
 | Local absolute paths (drive letter) | Drive-letter style paths such as `D:\...`, `C:/...` |
-| Unix absolute paths | `/home/...`, `/Users/...`, `/root/...`, `/etc/...`, `/tmp/...`, … |
+| Unix home paths | `/home/<name>/...`, `/Users/<name>/...`, `/root/...` — **home directories only** (the path says whose machine it is). `/usr`, `/etc`, `/var`, `/opt`, `/srv`, `/mnt`, `/media` and `/tmp` are shared system paths with no personal information: since v0.7.0 they are **neither reported nor sanitized** |
 | UNC / network paths | `\\server\share\...` |
-| User-directory paths | Paths under the OS user profile directory (`C:\Users\<name>`, `/home/<name>`, `/Users/<name>`) |
+| User-directory paths | Paths under the OS user profile directory (`C:\Users\<name>`, `/home/<name>`, `/Users/<name>`); mount prefixes in front of the home directory are consumed too (`/System/Volumes/Data/Users/<name>/…`, `/Volumes/<volume>/Users/<name>/…`, `/mnt|media/<name>/Users/<name>/…`), so no half-sanitized prefix is left behind |
+| Mount / derived paths | `/Volumes/<volume>`, `/System/Volumes/Data`, `/private`, `/nix/store` — these are **machine-specific** (volume names are user-chosen, `/private` carries a per-machine hash, `/nix/store` exposes the local package layout), unlike `/usr` or `/etc`, which are identical on every machine. Replaced with `<本机路径>`, sub-path kept |
 | Suspected credentials / tokens | Assignments such as `api_key`, `access_key`, `secret`, `password`, `token`, `bearer`, `authorization`, `credential` — **quoted or unquoted** |
 | Bare key shapes | The keys themselves: `sk-...`, `ghp_...`, `github_pat_...`, `glpat-...`, `AKIA...`, `xox?-...`, JWTs (`eyJ.....*.*`) |
 | Personal nicknames | User nickname text (injected by the deployer via `config.personalPatterns`) |
 
 Counts are tallied per file + rule + line, so multiple hits on one line are all counted (no more "one hit per rule per file").
 
+Scan cache: "Preview" and "Pack" both hit the same `/create` endpoint; the backend caches scan results by **file name + content SHA-256**, so the same content is never read and matched twice. **Change the content and the fingerprint changes, forcing a re-scan** — this is a performance optimization, not a correctness trade-off (calls without a SHA-256 are never cached, and editing the deployer's personal patterns invalidates the whole cache).
+
 **Blocking policy**:
 
-- **Share mode** — any hit returns an error and the pack is **hard-blocked**; no zip is produced. Share packs are meant for others, so the policy is deliberately strict.
-- **Migrate mode** — hits are reported only; inspect them in advance with `/pack scan` or `--dry-run` and decide yourself.
+- **Share mode** — a hit is **never blocked, but sanitizing is forced**: the `sanitize` flag sent by the UI is ignored and every pack is sanitized (paths become placeholders, credentials become `<已移除的密钥>`; only the copy inside the pack changes, source files are untouched). Share packs are meant for others, so content is rewritten rather than passed through. Two things *do* fail a share pack: selecting a module the share preset forbids (**only `skills` is allowed**; anything else → `share_scope`), and files whose content cannot be read and therefore never went through the scan (fail-closed, the file list is reported).
+- **Migrate mode** — hits are reported only; inspect them in advance with `/pack scan` or `--dry-run` and decide yourself, or opt into "sanitize before packing".
 
 **Never packed**: `.credentials.yaml` and `.anonymous-user-id` are skipped in every module's file walk, regardless of mode — local identity/credential files never enter a pack.
 
@@ -149,14 +152,22 @@ Other security measures:
 
 - Every file's **SHA-256** fingerprint is recorded in `manifest.json` for fail-closed integrity checks on restore; entries **without a well-formed fingerprint are rejected**, and files whose hash cannot be computed are skipped at pack time and reported (a blank fingerprint is never written).
 - Restore containment is **two-sided**: the source must stay inside the extraction directory and the target must stay inside its module root (zip-slip / tampered manifests with `../` escapes are rejected). Absolute paths, drive-letter paths, UNC paths and `..` segments are rejected by a whitelist before restore even starts.
-- Before unpacking, archive members are listed with `tar -tf` and whitelisted (absolute / drive-letter / UNC / `..` names rejected), and symlink / hardlink / device members are refused; the extracted tree is scanned again for symlinks. Temporary extraction directories are always cleaned up in `try/finally` — on success and on failure.
+- Before unpacking, archive members are enumerated from the ZIP central directory by the plugin's own reader (no external commands) and whitelisted (absolute / drive-letter / UNC / `..` names rejected), and symlink / hardlink / device members are refused; the extracted tree is scanned again for symlinks. Temporary extraction directories are always cleaned up in `try/finally` — on success and on failure.
 - Targets are backed up first (`<packs>/.restore-backups/<timestamp>/`), written to a temp file and swapped in with an atomic `rename`; any failure aborts and rolls back what this run already replaced or added.
 ### How memory migrates (read this)
 
-The `memory` module in a pack only carries the **human-readable Markdown mirror**; the real source of truth is the SQLite database
-`<DSH_BIOMEMORY_DIR || ~/.dsh/biomemory>/biomemory.db`. A live WAL database cannot be copied safely, so it is **never in the pack**.
-To migrate memory completely: **stop DSH first**, then copy `biomemory.db` (plus any `-wal` / `-shm` sidecars) to the same path on the target machine.
-Moving the pack alone gives the target only the mirror, not the memory itself.
+Since **v0.2.6 the memory truth source is in the pack**: the `memoryDb` module stores a consistent `VACUUM INTO` snapshot of
+`<DSH_BIOMEMORY_DIR || ~/.dsh/biomemory>/biomemory.db` (entries plus audit records) instead of copying a live, DSH-held WAL database —
+a plain copy of a live WAL database would not be safe, hence the snapshot. If the snapshot cannot be taken the file is skipped and
+listed under `unreadable` rather than silently dropped.
+
+| Module | Contents | Enough for migration? |
+| --- | --- | --- |
+| `memoryDb` | **`VACUUM INTO` consistent snapshot** of `biomemory.db` (entries + audit) | ✅ the memory itself |
+| `memory` | Read-only Markdown mirror under `DSH_MEMORY_ROOT`, meant for humans | ⚠️ readable copy only |
+
+Restore still skips `*.db*` by default (`includeDb: true` writes them) so a memory database in use on the target machine is never
+overwritten — **stop DSH before restoring** if you want `memoryDb` written back.
 
 - SQLite is handled on both sides: **packing** takes a consistent `VACUUM INTO` snapshot (`memoryDb`, since v0.2.6) instead of copying a live, DSH-held WAL database (failure means the file is skipped and listed under `unreadable`); **restore** still skips `*.db*` by default (`includeDb: true` writes them) so a memory database in use on the target machine is never overwritten.
 - Pack file names carry a unique suffix (`dsh-packer-<timestamp>-<random>-<mode>.zip`) so packs created within the same second never overwrite each other.
@@ -246,6 +257,9 @@ The Settings page is one page in five blocks, following the packer's task chain:
 
 | Version | Date | Type | Highlights |
 | --- | --- | --- | --- |
+| **v0.7.2** | 2026-10-28 | **Fixes the false "pack failed (network · Failed to fetch)"** | On a full migration (17469 files) the preview response was ~3.9 MB (3.5 MB of that the manifest) and the terminal poll still carried 2000+ privacy findings. When the host bridge dropped either large response the UI reported `network · Failed to fetch` even though the server had already written the pack (measured: a 218 MB zip with 17470 valid entries). Three fixes: (1) preview returns the first 1000 file entries plus `filesTotal` (the panel only renders the first 200 anyway); (2) the poll view replaces `result.privacy` with `privacyCount` (the create flow only reads `pack` / `warnings`); (3) the client now retries polls on network errors / 5xx with backoff (up to 10 tries, ≤5 s apart) instead of treating one hiccup as a failed pack. |
+| **v0.7.1** | 2026-10-28 | **Tests shipped with the package** | `files` now includes `tests`, plus a new `tests/privacy.test.mjs` (zero dependencies, `node --test`) that pins the behaviour this release promises: shebang lines survive untouched, Unix system paths (`/usr`, `/etc`, ...) are neither reported nor rewritten, home directories and Windows user directories are sanitized, URLs are left whole, and `SCHEMA_VERSION` stays at 1 so older packs still restore. Previously the manifest declared `npm test` while the tarball carried no tests, so it failed right after install. |
+| **v0.7.0** | 2026-10-27 | **Engineering refactor + privacy-scope correction + accessible UI** | (1) **Backend layering**: `index.mjs` drops from 3204 to 306 lines (assembly and re-exports only), split into `lib/{constants,errors,logger,util,modules,privacy,recycle,archive,pack,restore,jobs,api,cli}.mjs`, with privacy rules collapsed into a **single rule source** shared by scanning and sanitizing (they no longer keep two divergent regex sets). (2) **Privacy scope corrected**: the Unix path rule now matches **home directories only** (`/home`, `/Users`, `/root`); `/usr`, `/etc`, `/var`, `/opt`, `/srv`, `/mnt`, `/media` and `/tmp` are shared system paths with no personal information, so they are no longer reported or rewritten — previously a `#!/usr/bin/env node` shebang was turned into `#!<Unix路径> node` and the script was destroyed. Shebang lines and URLs are now protected ranges. (3) **Frontend engineering**: `lib/client.js` stops being "a build artifact maintained as source" and becomes **TypeScript source plus a reproducible esbuild build** (`src/client/`: `copy` / `styles` / `types` / `format` / `api` / `hooks` / `model` / `ui` / `view/*`); `npm run typecheck` is clean. (4) **Accessibility**: dialogs gain `role=dialog` + `aria-modal` + `aria-labelledby` + Escape-to-close + a Tab focus trap + focus restore on close; the progress bar is a `role=progressbar` that omits `aria-valuenow` in the indeterminate state; table headers carry `scope=col`; async results are announced via `aria-live`. (5) **Fixes**: the ZIP classic-format 65535-entry limit now raises a readable error instead of writing a broken archive; SQLite snapshot directories no longer leak after `/scan`; the missing `passwordEmpty` copy string is added. Tests 91 → 102 (new artifact smoke tests and real jsdom render tests). (6) **Sanitize gaps closed + scan cache**: a new "mount / derived path" rule now rewrites `/Volumes/<volume>`, `/System/Volumes/Data`, `/private` and `/nix/store` — previously these were missed entirely, or only replaced up to the home directory, leaving half-sanitized output such as `/System/Volumes/Data<用户目录>/…`; the user-directory rule now consumes the mount prefix as well. Privacy scan results are cached by **file name + content SHA-256**, so "Preview" followed by "Pack" no longer scans the same files twice (any content change invalidates the entry at once). The UI spec is brought in line with the v0.7.0 structure (`docs/ui-spec.md`, replacing `ui-v060-spec.md`). Tests 103 → 106. |
 | **v0.6.5** | 2026-10-25 | **Session images/attachments now travel with migrations** | (1) New `attachments` module (root `~/.dsh/attachments`, `skipDirs: ['tmp']`, on by default for migration, never for sharing): session logs only hold an `{"type":"image","attachment":{"attachmentId":"sha256:…"}}` reference, while the bytes live under `attachments/v1/objects/<first2>/<sha256>` (content-addressed, deduplicated, append-only) — a pack with `sessions` alone leaves every session image broken after a restore. (2) `SENSITIVE_MODULES` gains `attachments`, so share mode is blocked server-side (not merely greyed out in the UI). (3) The "Session records" group in the settings page becomes `["sessions","attachments"]` (without it the backend module exists but the UI cannot select it). (4) `MEMORY_ROOT` now follows `DSH_HOME` (it used `os.homedir()`, diverging from memoryDb). (5) The module table gains `attachments` (plus the missing `plugins` row) and documents that session images live in `attachments` and the "Session records" group packs them; objects are content-addressed, so no reference rewriting is needed on restore. Tests 87 → 91. |
 | **v0.6.4** | 2026-10-25 | **Per-platform trash + manual path fallback** | (1) **Trash is dispatched per platform** (`recycleFileNative` contract unchanged: `true` on success, `false` when the platform has none, throw on failure → `deletePack` degrades and reports a warning): Windows keeps PowerShell `SendToRecycleBin`; macOS uses `osascript -e 'tell application "Finder" to delete POSIX file "<path>"'` (quote/backslash escaping, 30s timeout); Linux implements the freedesktop Trash spec in pure Node — the file moves to `$XDG_DATA_HOME/Trash/files/<name>` (defaults to `~/.local/share`, `.1` suffix on collisions) and `Trash/info/<name>.trashinfo` records `Path=` (URL-encoded absolute path) plus `DeletionDate=` (local time `YYYY-MM-DDThh:mm:ss`); HarmonyOS and everything else still return `false` (permanent delete + warning). (2) **Manual path**: the restore page keeps its "or type a pack path" entry; `/status` gains three platform capability fields (`platform` / `trash` / `filePicker`), so platforms without a system file picker (HarmonyOS) show "当前平台请直接填写包路径" and treat manual input as the primary entry, while the delete confirmation tells the truth (not recoverable). The web layer cannot obtain host paths, so no platform renders a dead picker button. (3) Path examples are platform-specific (`/storage/…`, `/home/…`, `/Users/…`). Tests 80 → 87. |
 | **v0.6.3** | 2026-10-25 | Docs / pack scope | **Cross-platform docs now ship inside the package**: `files` gains `docs`, so an installed plugin carries `docs/platform-support.md` (support matrix for Windows / macOS / Linux / HarmonyOS, plus the two limits: Recycle Bin and system file picker). No code or behavior change. |
@@ -278,7 +292,7 @@ Usually one of: the zip was not created by dsh-packer (no `manifest.json` inside
 
 **My share pack got blocked — what now?**
 
-Share mode is deliberately strict: any hit (absolute path, user-directory path, suspected credential, nickname, …) aborts the pack with an error. Run `/pack scan` to see which files match, clean or replace the sensitive content, then retry. For personal backups you can use migrate mode (report-only), but never distribute such packs to others.
+Share mode does **not** abort on privacy hits — hits are always sanitized before packing. Only two things fail a share pack: selecting a module the share preset forbids (only `skills` is allowed; anything else returns `share_scope`), and files whose content cannot be read and therefore never went through the scan (fail-closed — the response lists them). For the first, drop the module that should not be shared; for the second, fix those files (permissions, lock, corruption) and retry. Use migrate mode when you need a faithful backup (report-only, no forced sanitizing).
 
 **How does the merge strategy work?**
 
