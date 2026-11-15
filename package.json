@@ -49,11 +49,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/KLRSL/dsh-packer.git"
+    "url": "git+https://github.com/K-W7/dsh-packer.git"
   },
-  "homepage": "https://github.com/KLRSL/dsh-packer#readme",
+  "homepage": "https://github.com/K-W7/dsh-packer#readme",
   "bugs": {
-    "url": "https://github.com/KLRSL/dsh-packer/issues"
+    "url": "https://github.com/K-W7/dsh-packer/issues"
   },
   "keywords": [
     "dsh",

@@ -4,7 +4,7 @@
 
 If you discover a security vulnerability in dsh-packer, please report it **privately** before public disclosure:
 
-- Open a [private security advisory](https://github.com/KLRSL/dsh-packer/security/advisories/new) (preferred), or
+- Open a [private security advisory](https://github.com/K-W7/dsh-packer/security/advisories/new) (preferred), or
 - Email the maintainer through your GitHub contact
 
 Please include a description of the vulnerability, steps to reproduce, and affected versions. You should receive a response within 7 days.

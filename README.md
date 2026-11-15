@@ -54,7 +54,7 @@ dsh plugin --profile desktop add dsh-packer
 
 ```bash
 # 需要已安装 git
-dsh plugin --profile desktop add github:KLRSL/dsh-packer
+dsh plugin --profile desktop add github:K-W7/dsh-packer
 ```
 
 ### 本地 bundle（开发 / link）
